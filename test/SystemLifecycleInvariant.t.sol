@@ -14,6 +14,7 @@ import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PvPadFactory} from "src/PvPadFactory.sol";
 import {PvPadHook} from "src/hooks/PvPadHook.sol";
 import {WorkerSubsidy} from "src/WorkerSubsidy.sol";
@@ -52,7 +53,6 @@ contract SystemLifecycleHandler is Test {
     mapping(uint256 => address) public creatorOf;
     mapping(uint256 => bool) public ghostGraduated;
     mapping(uint256 => uint128) public lockedLiquidityAt;
-    mapping(uint256 => uint256) public ghostEthDonated;
     mapping(uint256 => uint256) public ghostTokenDonated;
     mapping(uint256 => mapping(address => uint256)) public ghostCurveDeferred;
     mapping(uint256 => mapping(address => uint256)) public ghostCurveDeferredKing;
@@ -77,6 +77,8 @@ contract SystemLifecycleHandler is Test {
     uint256 public poolSwaps;
     uint256 public deferrals;
     uint256 public deliveries;
+    uint256 public realignedLaunches;
+    uint256 public resaltedLaunches;
 
     constructor(PvPadFactory factory_, PoolSwapTest router_, address[3] memory actors_, address[2] memory creators_) {
         factory = factory_;
@@ -119,6 +121,69 @@ contract SystemLifecycleHandler is Test {
         _approveAll(id);
     }
 
+    struct RecoveryBalances {
+        uint256 managerEth;
+        uint256 hookEth;
+        uint256 escrowEth;
+        uint256 creatorEth;
+    }
+
+    /// @dev Exercise both recovery paths while other launches may already hold reserves, locked LP
+    /// or deferred fees. The existing ledgers must still balance after every later action.
+    function poisonAndCreateLaunch(uint8 creatorSeed, uint8 depthSeed, uint160 priceSeed, bool exhaust) public {
+        uint256 id = factory.launchCount();
+        if (id >= MAX_LAUNCHES) return;
+        address creator = creators[creatorSeed % 2];
+        uint160 poison;
+        address[] memory candidates;
+        address predicted;
+        {
+            string memory name = string.concat("System launch ", vm.toString(id));
+            uint256 attempts = factory.MAX_SALT_ATTEMPTS();
+            uint256 depth = exhaust ? attempts : bound(depthSeed, 1, attempts - 1);
+            uint160 canonical = factory.canonicalSqrtPriceX96();
+            poison = depthSeed % 2 == 0
+                ? uint160(bound(priceSeed, TickMath.MIN_SQRT_PRICE, canonical - 1))
+                : uint160(bound(priceSeed, canonical + 1, TickMath.MAX_SQRT_PRICE - 1));
+            candidates = new address[](depth);
+            for (uint256 i; i < depth; ++i) {
+                (address candidate, uint256 attempt) = factory.predictLaunchToken(creator, name, "SYS", bytes32(0));
+                assertEq(attempt, i, "prediction advances past each poisoned candidate");
+                candidates[i] = candidate;
+                PoolKey memory key =
+                    PoolKey(Currency.wrap(address(0)), Currency.wrap(candidate), 0, 60, IHooks(address(hook)));
+                manager.initialize(key, poison);
+            }
+            uint256 selectedAttempt;
+            (predicted, selectedAttempt) = factory.predictLaunchToken(creator, name, "SYS", bytes32(0));
+            assertEq(selectedAttempt, exhaust ? 0 : depth);
+        }
+        RecoveryBalances memory before =
+            RecoveryBalances(address(manager).balance, address(hook).balance, address(escrow).balance, creator.balance);
+        createLaunch(creatorSeed);
+        (, address token,,, PoolId poolId) = factory.launches(id);
+        assertEq(token, predicted);
+        if (exhaust) {
+            assertEq(token, candidates[0]);
+            ++realignedLaunches;
+        } else {
+            ++resaltedLaunches;
+        }
+        (uint160 price,,,) = StateLibrary.getSlot0(manager, poolId);
+        assertEq(price, factory.canonicalSqrtPriceX96(), "recovery never admits a foreign opening price");
+        assertEq(address(manager).balance, before.managerEth, "recovery cannot spend another pool's ETH");
+        assertEq(address(hook).balance, before.hookEth, "recovery cannot spend deferred fees");
+        assertEq(address(escrow).balance, before.escrowEth);
+        assertEq(creator.balance, before.creatorEth - LAUNCH_FEE);
+        for (uint256 i = exhaust ? 1 : 0; i < candidates.length; ++i) {
+            PoolKey memory key =
+                PoolKey(Currency.wrap(address(0)), Currency.wrap(candidates[i]), 0, 60, IHooks(address(hook)));
+            (uint160 untouched,,,) = StateLibrary.getSlot0(manager, key.toId());
+            assertEq(untouched, poison);
+            assertEq(candidates[i].code.length, 0);
+        }
+    }
+
     /// @dev Every privileged or malformed entry point an outsider could try, asserted to fail closed.
     function probeRejections(uint8 launchSeed, uint8 actorSeed) public {
         address actor = actors[actorSeed % 3];
@@ -149,6 +214,10 @@ contract SystemLifecycleHandler is Test {
         escrow.recordTradeFeeNative{value: 1}(actor, 1);
         vm.expectRevert(PvPadHook.NotPoolManager.selector);
         hook.beforeAddLiquidity(actor, key, IPoolManager.ModifyLiquidityParams(-60, 60, 1, bytes32(0)), "");
+        vm.expectRevert(PvPadHook.NotLaunchFactory.selector);
+        hook.realignPool(key, uint160(1) << 96);
+        vm.expectRevert(PvPadHook.NotPoolManager.selector);
+        hook.unlockCallback(abi.encode(key, true, uint160(1) << 95));
         vm.expectRevert(WorkerSubsidy.NotUpdater.selector);
         workers.setEpoch(bytes32(uint256(1)), block.timestamp, block.timestamp + 1 days);
         uint256 price = king.claimPrice();
@@ -287,12 +356,15 @@ contract SystemLifecycleHandler is Test {
         uint256 amount = bound(amountSeed, 1, 1 ether);
         uint256 reserve = curve.ethReserve();
         uint256 cap = curve.maxBuyInput();
+        uint256 actorBefore = actor.balance;
+        uint256 curveBefore = curveAddress.balance;
         vm.prank(actor);
         (bool ok,) = curveAddress.call{value: amount}("");
-        assertTrue(ok);
-        assertEq(curve.ethReserve(), reserve, "donations never enter the reserves");
-        assertEq(curve.maxBuyInput(), cap, "donations never move the curve");
-        ghostEthDonated[id] += amount;
+        assertFalse(ok, "plain ETH transfers are refused");
+        assertEq(actor.balance, actorBefore, "rejected ETH stays with the sender");
+        assertEq(curveAddress.balance, curveBefore);
+        assertEq(curve.ethReserve(), reserve, "rejected donations never enter the reserves");
+        assertEq(curve.maxBuyInput(), cap, "rejected donations never move the curve");
     }
 
     function donateTokensToCurve(uint8 launchSeed, uint8 actorSeed, uint256 amountSeed) public {
@@ -679,8 +751,8 @@ contract SystemLifecycleHandler is Test {
             assertEq(curve.graduated(), graduated);
             assertEq(
                 address(curve).balance,
-                curve.ethReserve() + curve.totalDeferredFees() + ghostEthDonated[i],
-                "curve ETH is reserves plus retained fees plus donations"
+                curve.ethReserve() + curve.totalDeferredFees(),
+                "curve ETH is reserves plus retained fees"
             );
             assertEq(
                 IERC20(tokenAddress).balanceOf(curveAddress),
@@ -889,7 +961,7 @@ contract SystemLifecycleInvariantTest is Test {
             vm.deal(creators[i], 1_000 ether);
         }
         handler = new SystemLifecycleHandler(factory, router, actors, creators);
-        bytes4[] memory selectors = new bytes4[](20);
+        bytes4[] memory selectors = new bytes4[](21);
         selectors[0] = handler.createLaunch.selector;
         selectors[1] = handler.buy.selector;
         selectors[2] = handler.buy.selector;
@@ -910,6 +982,7 @@ contract SystemLifecycleInvariantTest is Test {
         selectors[17] = handler.donateTokensToCurve.selector;
         selectors[18] = handler.fundWorkers.selector;
         selectors[19] = handler.probeRejections.selector;
+        selectors[20] = handler.poisonAndCreateLaunch.selector;
         targetSelector(FuzzSelector(address(handler), selectors));
         targetContract(address(handler));
     }
@@ -931,6 +1004,36 @@ contract SystemLifecycleInvariantTest is Test {
     }
 
     function invariant_workerPotAndCrownFollowTheFrozenEconomics() public view {
+        handler.checkWorkersAndCrown();
+    }
+
+    function test_recoveredLaunchesPreserveLivePoolReservesAndDeferredFees() public {
+        handler.claimKing(0, 0, 0);
+        handler.buy(0, 0, 5 ether, true);
+        handler.graduate(0, 0);
+        handler.setOutage(true);
+        handler.swap(0, 0, 0, uint128(0.01 ether));
+        assertGt(handler.hook().totalDeferred(), 0);
+        // Recover from both sides of the canonical price, then exercise the bounded re-salt path.
+        handler.poisonAndCreateLaunch(1, 0, TickMath.MIN_SQRT_PRICE, true);
+        handler.poisonAndCreateLaunch(0, 1, TickMath.MAX_SQRT_PRICE - 1, true);
+        handler.poisonAndCreateLaunch(1, 15, uint160(1) << 96, false);
+        assertEq(handler.realignedLaunches(), 2);
+        assertEq(handler.resaltedLaunches(), 1);
+        assertEq(handler.factory().launchCount(), 4);
+        handler.buy(1, 1, 5 ether, true);
+        handler.graduate(1, 1);
+        handler.swap(1, 1, 0, uint128(0.02 ether));
+        handler.probeRejections(1, 2);
+        handler.setOutage(false);
+        handler.flushCurve(1, 0);
+        handler.retryHook(0, 0);
+        handler.retryHook(1, 0);
+        handler.withdraw(0, 0);
+        handler.checkTokenSupplyAccounting();
+        handler.checkCurveCustody();
+        handler.checkGraduationFinalityAndPools();
+        handler.checkFeeCustodyAndEntitlements();
         handler.checkWorkersAndCrown();
     }
 

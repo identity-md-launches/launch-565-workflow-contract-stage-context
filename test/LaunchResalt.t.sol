@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {PoolManager} from "@uniswap/v4-core/src/PoolManager.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
@@ -263,6 +264,163 @@ contract LaunchResaltTest is Test {
         (address next,) = factory.predictLaunchToken(creator, "Plain", "PLN", 0);
         assertTrue(next != predicted);
         assertEq(next, _token(address(factory), 2, creator, "Plain", "PLN", 0, 0));
+    }
+
+    /// forge-config: default.fuzz.runs = 128
+    function testFuzz_allCandidatesPoisonedAtMixedPricesRecoversWithoutMovingValue(
+        uint160 priceSeed,
+        bytes32 userSalt,
+        bool firstBelowCanonical
+    ) public {
+        uint160 canonical = factory.canonicalSqrtPriceX96();
+        uint160 low = uint160(bound(priceSeed, TickMath.MIN_SQRT_PRICE, canonical - 1));
+        uint160 high = uint160(bound(priceSeed, canonical + 1, TickMath.MAX_SQRT_PRICE - 1));
+        _poisonMixedCandidates(userSalt, low, high, firstBelowCanonical);
+        {
+            (address predicted, uint256 attempt) = factory.predictLaunchToken(creator, "Mixed", "MIX", userSalt);
+            assertEq(predicted, _token(address(factory), 1, creator, "Mixed", "MIX", userSalt, 0));
+            assertEq(attempt, 0);
+        }
+        _assertMixedRecovery(userSalt);
+        _assertMixedCandidatesUntouched(userSalt, low, high, firstBelowCanonical);
+    }
+
+    function _poisonMixedCandidates(bytes32 userSalt, uint160 low, uint160 high, bool firstBelowCanonical) private {
+        for (uint256 i; i < factory.MAX_SALT_ATTEMPTS(); ++i) {
+            uint160 poison = (i % 2 == 0) == firstBelowCanonical ? low : high;
+            manager.initialize(_key(_token(address(factory), 1, creator, "Mixed", "MIX", userSalt, i)), poison);
+        }
+    }
+
+    function _assertMixedRecovery(bytes32 userSalt) private {
+        uint256 balanceBefore = creator.balance;
+        uint256 managerBefore = address(manager).balance;
+        vm.prank(creator);
+        uint256 id = factory.createLaunch{value: FEE}("Mixed", "MIX", userSalt);
+        (, address token, address curve,, PoolId poolId) = factory.launches(id);
+        assertEq(id, 1);
+        assertEq(token, _token(address(factory), 1, creator, "Mixed", "MIX", userSalt, 0));
+        (uint160 price,,,) = StateLibrary.getSlot0(manager, poolId);
+        assertEq(price, factory.canonicalSqrtPriceX96());
+        assertEq(StateLibrary.getLiquidity(manager, poolId), 0);
+        assertEq(PvPadToken(token).totalSupply(), 1e27);
+        assertEq(PvPadToken(token).balanceOf(curve), 1e27);
+        assertEq(PvPadToken(token).balanceOf(address(manager)), 0);
+        assertEq(address(manager).balance, managerBefore);
+        assertEq(creator.balance, balanceBefore - FEE);
+        assertEq(workers.workerPot(), FEE);
+        assertEq(address(workers).balance, FEE);
+        assertEq(address(factory).balance, 0);
+        assertEq(address(hook).balance, 0);
+        assertEq(address(factory.feeEscrow()).balance, 0);
+    }
+
+    function _assertMixedCandidatesUntouched(bytes32 userSalt, uint160 low, uint160 high, bool firstBelowCanonical)
+        private
+        view
+    {
+        for (uint256 i = 1; i < factory.MAX_SALT_ATTEMPTS(); ++i) {
+            address sibling = _token(address(factory), 1, creator, "Mixed", "MIX", userSalt, i);
+            PoolId siblingId = _key(sibling).toId();
+            (uint160 untouched,,,) = StateLibrary.getSlot0(manager, siblingId);
+            assertEq(untouched, (i % 2 == 0) == firstBelowCanonical ? low : high);
+            assertEq(sibling.code.length, 0);
+            assertEq(StateLibrary.getLiquidity(manager, siblingId), 0);
+            (IPvPadLaunchRegistry registry,,) = hook.bindings(siblingId);
+            assertEq(address(registry), address(0));
+        }
+    }
+
+    function test_missingRealignmentCallbackRollsBackLaunchAndCanRetry() public {
+        vm.mockCall(address(manager), abi.encodeWithSelector(IPoolManager.unlock.selector), abi.encode(bytes("")));
+        _assertRecoveryFailureAndRetry(PvPadHook.InvalidCallback.selector);
+    }
+
+    function test_nonzeroRealignmentDeltaRollsBackLaunchAndCanRetry() public {
+        // Inject an impossible result from the trusted manager to exercise the hook's hard stop.
+        vm.mockCall(address(manager), abi.encodeWithSelector(IPoolManager.swap.selector), abi.encode(int256(1)));
+        _assertRecoveryFailureAndRetry(PvPadHook.RealignFailed.selector);
+    }
+
+    function test_zeroDeltaWithoutPriceMovementRollsBackLaunchAndCanRetry() public {
+        vm.mockCall(address(manager), abi.encodeWithSelector(IPoolManager.swap.selector), abi.encode(int256(0)));
+        _assertRecoveryFailureAndRetry(PvPadHook.RealignFailed.selector);
+    }
+
+    function test_factoryRejectsRecoveryThatDidNotRestoreCanonicalPriceAndCanRetry() public {
+        vm.mockCall(address(hook), abi.encodeWithSelector(PvPadHook.realignPool.selector), bytes(""));
+        _assertRecoveryFailureAndRetry(PvPadFactory.UnexpectedPoolPrice.selector);
+    }
+
+    function test_workerFailureAfterRealignmentRestoresPoisonedPriceAndCanRetry() public {
+        vm.mockCallRevert(address(workers), abi.encodeCall(WorkerSubsidy.fundWorkers, ()), hex"deadbeef");
+        _assertRecoveryFailureAndRetry(bytes4(0xdeadbeef));
+    }
+
+    function _assertRecoveryFailureAndRetry(bytes4 expectedError) private {
+        uint256 attempts = factory.MAX_SALT_ATTEMPTS();
+        for (uint256 i; i < attempts; ++i) {
+            manager.initialize(_key(_token(address(factory), 1, creator, "Retry", "RTY", 0, i)), POISON);
+        }
+        address first = _token(address(factory), 1, creator, "Retry", "RTY", 0, 0);
+        // CREATE2 for the token also advances the factory nonce before the curve's CREATE.
+        address expectedCurve = vm.computeCreateAddress(address(factory), vm.getNonce(address(factory)) + 1);
+        uint256 creatorBefore = creator.balance;
+        uint256 managerBefore = address(manager).balance;
+        vm.prank(creator);
+        vm.expectRevert(expectedError);
+        factory.createLaunch{value: FEE}("Retry", "RTY", bytes32(0), "ipfs://retry");
+
+        assertEq(factory.launchCount(), 1);
+        assertEq(factory.launchMetadataURI(1), "");
+        (, address rolledBackToken, address rolledBackCurve,,) = factory.launches(1);
+        assertEq(rolledBackToken, address(0));
+        assertEq(rolledBackCurve, address(0));
+        assertEq(expectedCurve.code.length, 0);
+        assertFalse(factory.isBondingCurve(expectedCurve));
+        assertFalse(factory.feeEscrow().authorizedRecorders(expectedCurve));
+        assertEq(creator.balance, creatorBefore);
+        assertEq(address(manager).balance, managerBefore);
+        assertEq(address(factory).balance, 0);
+        assertEq(address(hook).balance, 0);
+        assertEq(workers.workerPot(), 0);
+        assertEq(address(workers).balance, 0);
+        for (uint256 i; i < attempts; ++i) {
+            address candidate = _token(address(factory), 1, creator, "Retry", "RTY", 0, i);
+            PoolId poolId = _key(candidate).toId();
+            assertEq(candidate.code.length, 0);
+            (uint160 price,,,) = StateLibrary.getSlot0(manager, poolId);
+            assertEq(price, POISON, "a reverted recovery restores every original pool price");
+            assertEq(StateLibrary.getLiquidity(manager, poolId), 0);
+            assertEq(factory.poolCreator(poolId), address(0));
+            assertFalse(factory.registeredPool(poolId));
+            (IPvPadLaunchRegistry registry, FeeEscrow escrow, address payee) = hook.bindings(poolId);
+            assertEq(address(registry), address(0));
+            assertEq(address(escrow), address(0));
+            assertEq(payee, address(0));
+        }
+
+        vm.clearMockedCalls();
+        vm.prank(creator);
+        uint256 id = factory.createLaunch{value: FEE}("Retry", "RTY", bytes32(0), "ipfs://retry");
+        (, address token, address curve,, PoolId actualPool) = factory.launches(id);
+        assertEq(id, 1);
+        assertEq(token, first);
+        assertEq(curve, expectedCurve);
+        assertEq(PvPadToken(token).balanceOf(curve), 1e27);
+        assertTrue(factory.isBondingCurve(curve));
+        assertTrue(factory.feeEscrow().authorizedRecorders(curve));
+        assertEq(factory.launchMetadataURI(id), "ipfs://retry");
+        (uint160 recovered,,,) = StateLibrary.getSlot0(manager, actualPool);
+        assertEq(recovered, factory.canonicalSqrtPriceX96());
+        assertEq(creator.balance, creatorBefore - FEE);
+        assertEq(workers.workerPot(), FEE);
+        assertEq(address(workers).balance, FEE);
+        // No stale callback authorization survives either the failed or successful realignment.
+        bytes memory callback = abi.encode(_key(first), true, factory.canonicalSqrtPriceX96());
+        vm.prank(address(manager));
+        vm.expectRevert(PvPadHook.InvalidCallback.selector);
+        hook.unlockCallback(callback);
     }
 
     function _token(
