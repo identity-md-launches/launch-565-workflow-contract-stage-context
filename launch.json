@@ -1,0 +1,40 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "Pepe Values Pepe",
+    "symbol": "PVP",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "WorkerSubsidy",
+      "constructorArgs": ["$owner"]
+    },
+    {
+      "contract": "KingOfThePad",
+      "constructorArgs": ["$contract:WorkerSubsidy"]
+    },
+    {
+      "contract": "PvPadHook",
+      "constructorArgs": ["0xe03a1074c86cfedd5c142c4f04f1a1536e203543"]
+    },
+    {
+      "contract": "PvPadFactory",
+      "constructorArgs": [
+        "0xe03a1074c86cfedd5c142c4f04f1a1536e203543",
+        "$contract:WorkerSubsidy",
+        "$contract:KingOfThePad",
+        "$contract:PvPadHook",
+        "$owner"
+      ]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "PvPad targets Ethereum Sepolia (11155111). Both PoolManager constructor arguments use Uniswap's Sepolia deployment listed at https://developers.uniswap.org/docs/protocols/v4/deployments#sepolia-11155111; target-chain simulation must verify the external dependency. LaunchToken is the protocol launch artifact, distinct from the identically named Pepe Values Pepe / PVP genesis PvPadToken. The pool object describes the protocol LaunchToken pool; admission fee 3000 is not a claim about its effective trading fee. PvPadFactory creates its own FeeEscrow and zero-create-fee genesis token and BondingCurve during construction; later createLaunch calls create additional token/curve pairs. These children require no separate manifest entries or initialization calls. Pad pools use native ETH, fee tier 0, tick spacing 60 and the factory's canonical graduation price. Pad trades charge 1%, split between king and creator; graduation at 4.2 ETH locks factory-owned liquidity. Launch fees and king bids fund WorkerSubsidy. PvPadHook has only the PoolManager constructor argument and requires CREATE2 address bits (address & 0x3fff) == 0x08cc, including beforeAddLiquidity and no beforeInitialize. Deployment must support a salt mined for the actual deployer, creation code and encoded constructor argument; this schema has no salt field and these notes do not configure one. PvPadFactory construction immediately binds and initializes genesis through that hook and PoolManager. Policy-resolved $owner is used for both the worker epoch updater and genesis creator fee beneficiary; these are separate roles whose assignment to the same address requires policy authorization and review. The updater controls Merkle allocations; genesis creator fees cannot be reassigned. The protocol factory supplies MerkleDistributor and PoolInitializationGuard. Policy, signed artifact linkage, independent review, admission, deployment and publication remain service responsibilities; this manifest does not assert those outcomes."
+}
