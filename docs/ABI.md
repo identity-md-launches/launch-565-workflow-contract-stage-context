@@ -7,16 +7,18 @@ Machine-readable ABI arrays in `docs/abi/<Contract>.json` are exported from Soli
 | `PvPadFactory.createLaunch(string,string)` | Exact launch fee; returns launch ID; default empty metadata and zero user salt |
 | `createLaunch(string,string,bytes32)` | Fresh user salt to change token/pool address |
 | `createLaunch(string,string,bytes32,string)` | Also records immutable metadata URI (up to 2048 bytes); JSON can hold image and socials |
-| `predictLaunchToken(address,string,string,bytes32)`, `MAX_SALT_ATTEMPTS`, `LaunchSaltRetried` | Token address and salt attempt (0..15) the next create would use; a nonzero attempt means a predicted pool was poisoned and skipped; reverts `UnexpectedPoolPrice` when all 16 are poisoned |
+| `predictLaunchToken(address,string,string,bytes32)`, `MAX_SALT_ATTEMPTS`, `LaunchSaltRetried` | Token address and salt attempt (0..15) the next create would use; a nonzero attempt means a predicted pool was poisoned and skipped; when all 16 are poisoned attempt 0 is returned and the create realigns that pool |
+| `LaunchPoolRealigned(launchId, foreignSqrtPriceX96)`, `PvPadHook.PoolRealigned(poolId, from, to)` | Emitted when a create found every candidate poisoned and moved the empty pool back to the canonical price; informational, the launch is otherwise identical |
+| `PvPadHook.realignPool(PoolKey,uint160)` | Bound-registry-only zero-value price reset for an empty pool; integrators never call it (`NotLaunchFactory`, `NothingToRealign`, `PoolHasLiquidity`, `RealignFailed`) |
 | `launches(id)`, `launchMetadataURI(id)`, `getPoolKey(id)` | Read creator, token, curve, graduated flag, PoolId, metadata and canonical pool key |
 | `LaunchCreated`, `LaunchMetadata`, `Graduated`, `LiquidityLocked` | Index by factory and launch ID, not token name/symbol |
 | `BondingCurve.quoteBuy`, `quoteSell`, `maxBuyInput` | Quote current state; buy quote caps executable input at the remaining threshold capacity |
 | `buy(address,uint256,uint256)` | Recipient, minimum token output, deadline; payable ETH input; excess refunded to caller |
 | `sell(uint256,address,uint256,uint256)` | Token amount, ETH recipient, minimum ETH output, deadline; approve curve for exact token input first |
-| `readyToGraduate`, `getReserves` | Progress from accounted net ETH; donations and pending fees do not count |
+| `readyToGraduate`, `getReserves` | Progress from accounted net ETH; token donations and pending fees do not count; the curve has no `receive()` and the factory's accepts only a registered curve (`NotBondingCurve`), so plain ETH transfers to either revert |
 | `PvPadFactory.graduate(id)` | Permissionless, once threshold reached; no ETH supplied; permanently locks liquidity |
 | `lockedLiquidity(id)`, `lockedTickLower(id)`, `lockedTickUpper(id)`, `LiquidityRangeLocked` | Actual factory-owned v4 position; salt `bytes32(id)`; full range in practice because the hook closes pre-graduation liquidity |
-| `PvPadHook.getHookPermissions`, `REQUIRED_FLAGS`, `bindings` | Flag layout (0x08cc) and per-pool factory/escrow/creator binding |
+| `PvPadHook.getHookPermissions`, `REQUIRED_FLAGS`, `bindings` | Flag layout (0x08cc) and per-pool factory/escrow/creator binding; the hook is shared and any contract can bind its own token's pool, so identify PvPad launches only through `PvPadFactory.launches(id)`/`getPoolKey(id)`, never through `pool.hooks` or `PoolBound` |
 | `PvPadHook.beforeAddLiquidity` | PoolManager-only; reverts `LiquidityClosed` (wrapped by v4 as `WrappedError`) for any non-factory deposit before graduation and for unbound pools; LP routers should surface this before graduation |
 | `KingOfThePad.claimKing(address)` | Beneficiary; payable value strictly exceeds current claimPrice; old king is not refunded |
 | `FeeEscrow.pending(address(0),account)`, `withdraw(address(0),to)` | Read native credit; only credited caller may withdraw, to a chosen nonzero address; returns 0 if recipient rejects |
@@ -24,7 +26,7 @@ Machine-readable ABI arrays in `docs/abi/<Contract>.json` are exported from Soli
 | `BondingCurve.flushDeferredFees(beneficiary)` | Anyone retries deferred curve fees; returns success without changing ownership |
 | `PvPadHook.retryDeferred(escrow,creator,beneficiary)` | Anyone retries hook fees; returns delivered amount, or 0 on failure/no fees |
 | `WorkerSubsidy.fundWorkers()` | Donate native ETH to available worker pot |
-| `setEpoch(bytes32,uint256,uint256)` | Updater-only root/start/end; reserves available pot for new monotonically increasing epoch |
+| `setEpoch(bytes32,uint256,uint256)` | Updater-only root/start/end; start at most 90 days ahead and window at most 90 days long (`InvalidWindow`); reserves available pot for new monotonically increasing epoch |
 | `claimWorker(uint256,address,uint256,bytes32[])` | Epoch/payee/amount/proof; may be relayed, payout always to payee |
 | `recycleExpiredEpoch(uint256)` | Permissionless; unclaimed reserved budget returns to available pot only after expiry |
 | `proposeUpdater`, `acceptUpdater` | Current updater nominates a nonzero replacement; nominee must accept |

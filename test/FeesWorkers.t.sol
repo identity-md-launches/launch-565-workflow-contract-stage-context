@@ -253,6 +253,11 @@ contract FeesWorkersTest is Test {
         workers.setEpoch(bytes32(uint256(1)), block.timestamp, block.timestamp);
         vm.expectRevert(WorkerSubsidy.InvalidWindow.selector);
         workers.setEpoch(bytes32(uint256(1)), block.timestamp, block.timestamp + 90 days + 1);
+        // The start may not be more than one maximum window ahead either, so the pot cannot be parked.
+        vm.expectRevert(WorkerSubsidy.InvalidWindow.selector);
+        workers.setEpoch(bytes32(uint256(1)), block.timestamp + 90 days + 1, block.timestamp + 90 days + 2);
+        vm.expectRevert(WorkerSubsidy.InvalidWindow.selector);
+        workers.setEpoch(bytes32(uint256(1)), block.timestamp + 36500 days, block.timestamp + 36500 days + 1);
         vm.stopPrank();
         assertEq(workers.workerPot(), 1 ether);
         assertEq(workers.reservedForEpochs(), 0);
@@ -263,6 +268,24 @@ contract FeesWorkersTest is Test {
         vm.prank(UPDATER);
         vm.expectRevert(WorkerSubsidy.NothingToFund.selector);
         workers.setEpoch(bytes32(uint256(1)), block.timestamp, block.timestamp + 1 days);
+    }
+
+    /// @dev A far-future start can delay the reserved pot by at most two maximum windows before claims
+    /// open and then recycling becomes possible; the updater cannot lock it indefinitely.
+    function testWorkerEpochStartBoundedByMaxWindowKeepsPotRecoverable() public {
+        workers.fundWorkers{value: 10 ether}();
+        uint256 start = block.timestamp + 90 days;
+        _setEpoch(workers.leaf(1, WORKER, 10 ether), start, start + 90 days);
+        assertEq(workers.workerPot(), 0);
+        assertEq(workers.reservedForEpochs(), 10 ether);
+        vm.expectRevert(WorkerSubsidy.EpochNotOpen.selector);
+        workers.claimWorker(1, WORKER, 10 ether, new bytes32[](0));
+        vm.expectRevert(WorkerSubsidy.EpochNotExpired.selector);
+        workers.recycleExpiredEpoch(1);
+        vm.warp(start);
+        workers.claimWorker(1, WORKER, 10 ether, new bytes32[](0)); // single-leaf tree: root == leaf
+        assertEq(WORKER.balance, 10 ether);
+        assertEq(workers.reservedForEpochs(), 0);
     }
 
     function testWorkerProofsRelayedClaimsDuplicatesAndBudgetIsolation() public {

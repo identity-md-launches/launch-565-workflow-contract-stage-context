@@ -11,6 +11,7 @@ import {PvPadHook} from "../src/hooks/PvPadHook.sol";
 import {PvPadFactory} from "../src/PvPadFactory.sol";
 import {BondingCurve} from "../src/BondingCurve.sol";
 import {HookMiner} from "../src/utils/HookMiner.sol";
+import {MineHookSalt} from "../script/MineHookSalt.s.sol";
 
 /// @dev Local service-factory stand-in. Never broadcasts, reads keys or changes the environment.
 contract LocalProjectDeployer {
@@ -61,6 +62,27 @@ contract ProjectDeploymentTest is Test {
         );
         assertEq(address(hook), predicted);
         assertEq(uint160(address(hook)) & 0x3fff, 0x08cc);
+        _assertProtocolSupply();
+    }
+
+    /// @dev The offline evidence script derives exactly the salt, init-code hash and address that the
+    /// service deployer needs; an unmined salt cannot construct the hook at all.
+    function test_mineHookSaltScriptMatchesTheDeployedHookAndUnminedSaltsFail() public {
+        // Evidence is derived before anything is deployed from this deployer, as the service would.
+        LocalProjectDeployer fresh = new LocalProjectDeployer();
+        MineHookSalt.Evidence memory evidence = new MineHookSalt().mine(address(fresh), address(manager));
+        bytes memory initCode = abi.encodePacked(type(PvPadHook).creationCode, abi.encode(manager));
+        assertEq(evidence.initCodeHash, keccak256(initCode));
+        assertEq(evidence.flags, 0x08cc);
+        assertEq(HookMiner.computeAddress(address(fresh), uint256(evidence.salt), initCode), evidence.hook);
+        for (uint256 salt = 1000; salt < 1008; ++salt) {
+            if (salt == uint256(evidence.salt)) continue;
+            vm.expectRevert(LocalProjectDeployer.DeploymentFailed.selector);
+            fresh.deploy(initCode, bytes32(salt));
+        }
+        address deployed = fresh.deploy(initCode, evidence.salt);
+        assertEq(deployed, evidence.hook);
+        assertEq(address(PvPadHook(payable(deployed)).poolManager()), address(manager));
         _assertProtocolSupply();
     }
 

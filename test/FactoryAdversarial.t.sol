@@ -159,6 +159,35 @@ contract FactoryAdversarialTest is Test {
         assertEq(PvPadToken(token).balanceOf(curve), 1e27);
     }
 
+    /// @dev Neither the factory nor a curve accepts plain ETH from anyone else; only the registered
+    /// curve's graduation sweep may push ETH into the factory, and nothing can ever be locked by mistake.
+    function test_strayEthToFactoryOrCurveIsRejectedWhileGraduationSweepStillWorks() public {
+        (,, address curve,,) = factory.launches(0);
+        address stranger = address(0x5712A9);
+        vm.deal(stranger, 3 ether);
+        vm.startPrank(stranger);
+        (bool ok,) = address(factory).call{value: 1 ether}("");
+        assertFalse(ok, "factory refuses stray ETH");
+        (ok,) = curve.call{value: 1 ether}("");
+        assertFalse(ok, "curve refuses stray ETH");
+        (ok,) = curve.call{value: 0}("");
+        assertFalse(ok, "curve has no fallback either");
+        vm.stopPrank();
+        assertEq(stranger.balance, 3 ether);
+        assertEq(address(factory).balance, 0);
+        assertEq(curve.balance, 0);
+        vm.prank(stranger);
+        vm.expectRevert(PvPadFactory.NotBondingCurve.selector);
+        payable(address(factory)).transfer(1 ether);
+
+        vm.prank(creator);
+        BondingCurve(payable(curve)).buy{value: 5 ether}(creator, 1, block.timestamp);
+        assertEq(curve.balance, 4.2 ether);
+        factory.graduate(0);
+        assertEq(curve.balance, 0, "sweep delivered the reserves to the factory");
+        assertGt(factory.lockedLiquidity(0), 0);
+    }
+
     function test_constructorRejectsMismatchedManagerAndWorkerPot() public {
         PoolManager otherManager = new PoolManager(address(this));
         vm.expectRevert(PvPadFactory.InvalidConfiguration.selector);

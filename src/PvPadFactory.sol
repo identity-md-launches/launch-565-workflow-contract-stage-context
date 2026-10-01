@@ -44,6 +44,7 @@ contract PvPadFactory is ReentrancyGuard {
     error InvalidCallback();
     error ZeroLiquidity();
     error LiquidityRangeUnavailable();
+    error NotBondingCurve();
 
     event LaunchCreated(
         uint256 indexed launchId, address indexed creator, address token, address curve, string name, string symbol
@@ -54,6 +55,9 @@ contract PvPadFactory is ReentrancyGuard {
     event LiquidityRangeLocked(uint256 indexed launchId, int24 tickLower, int24 tickUpper);
     /// @notice Emitted when a predicted pool was preinitialized at a foreign price and a later salt was used.
     event LaunchSaltRetried(uint256 indexed launchId, uint256 attempt, address token);
+    /// @notice Emitted when every bounded candidate was poisoned and the empty pool was moved back to
+    /// the canonical price through the hook instead.
+    event LaunchPoolRealigned(uint256 indexed launchId, uint160 foreignSqrtPriceX96);
 
     /// @notice Bound on automatic salt retries when predicted pools are poisoned at a foreign price.
     uint256 public constant MAX_SALT_ATTEMPTS = 16;
@@ -188,7 +192,7 @@ contract PvPadFactory is ReentrancyGuard {
         poolCreator[poolId] = creator;
         feeEscrow.authorizeRecorder(curve, true);
         hook.bindPool(key, creator, feeEscrow);
-        _initializeCanonicalPool(key, poolId);
+        _initializeCanonicalPool(key, poolId, launchId);
         IERC20(token).safeTransfer(curve, PvPadConstants.TOKEN_SUPPLY);
         emit LaunchCreated(launchId, creator, token, curve, name, symbol);
     }
@@ -203,18 +207,25 @@ contract PvPadFactory is ReentrancyGuard {
         if (attempt != 0) emit LaunchSaltRetried(launchId, attempt, token);
     }
 
-    /// @dev Never seed at a foreign price. The salt scan already avoided one; this is the hard stop.
-    function _initializeCanonicalPool(PoolKey memory key, PoolId poolId) private {
+    /// @dev Never seed at a foreign price. The salt scan prefers an unpoisoned candidate; when every
+    /// candidate is poisoned the pool (bound to this factory, empty by the hook's liquidity gate) is
+    /// moved back to the canonical price through the hook. The re-read is the hard stop.
+    function _initializeCanonicalPool(PoolKey memory key, PoolId poolId, uint256 launchId) private {
         (uint160 existingPrice,,,) = StateLibrary.getSlot0(poolManager, poolId);
         if (existingPrice == 0) {
             poolManager.initialize(key, canonicalSqrtPriceX96);
-        } else if (existingPrice != canonicalSqrtPriceX96) {
-            revert UnexpectedPoolPrice();
+            return;
         }
+        if (existingPrice == canonicalSqrtPriceX96) return;
+        hook.realignPool(key, canonicalSqrtPriceX96);
+        (uint160 price,,,) = StateLibrary.getSlot0(poolManager, poolId);
+        if (price != canonicalSqrtPriceX96) revert UnexpectedPoolPrice();
+        emit LaunchPoolRealigned(launchId, existingPrice);
     }
 
     /// @notice Token address and salt attempt the next `createLaunch` with these inputs would use.
-    /// @dev Reverts UnexpectedPoolPrice when every bounded candidate pool is poisoned at a foreign price.
+    /// @dev When every bounded candidate pool is poisoned at a foreign price the first candidate is
+    /// returned and the create realigns its pool instead of reverting.
     function predictLaunchToken(address creator, string calldata name, string calldata symbol, bytes32 userSalt)
         external
         view
@@ -226,12 +237,18 @@ contract PvPadFactory is ReentrancyGuard {
     /// @dev Attempt 0 keeps the original salt derivation. Someone who predicts a token address can
     /// preinitialize its pool (the shared hook has no beforeInitialize) at a foreign price; rather than
     /// failing the whole create, skip to the next salt. A canonical-price preinitialization is accepted.
+    /// When all candidates are poisoned, the first one is used and `_initializeCanonicalPool` realigns
+    /// it; the genesis candidates are a pure function of the factory address, so this path must never
+    /// revert inside the constructor.
     function _selectSalt(uint256 launchId, address creator, string memory name, string memory symbol, bytes32 userSalt)
         private
         view
         returns (bytes32 salt, address token, uint256 attempt)
     {
         bytes32 initCodeHash = keccak256(abi.encodePacked(type(PvPadToken).creationCode, abi.encode(name, symbol)));
+        bytes32 fallbackSalt;
+        address fallbackToken;
+        uint256 fallbackAttempt;
         for (attempt = 0; attempt < MAX_SALT_ATTEMPTS; ++attempt) {
             salt = attempt == 0
                 ? keccak256(abi.encode(launchId, creator, name, symbol, userSalt))
@@ -241,8 +258,10 @@ contract PvPadFactory is ReentrancyGuard {
             if (token.code.length != 0) continue;
             (uint160 existingPrice,,,) = StateLibrary.getSlot0(poolManager, _poolKey(token).toId());
             if (existingPrice == 0 || existingPrice == canonicalSqrtPriceX96) return (salt, token, attempt);
+            if (fallbackToken == address(0)) (fallbackSalt, fallbackToken, fallbackAttempt) = (salt, token, attempt);
         }
-        revert UnexpectedPoolPrice();
+        if (fallbackToken == address(0)) revert InvalidConfiguration();
+        return (fallbackSalt, fallbackToken, fallbackAttempt);
     }
 
     function getPoolKey(uint256 launchId) external view returns (PoolKey memory) {
@@ -341,5 +360,9 @@ contract PvPadFactory is ReentrancyGuard {
         }
     }
 
-    receive() external payable {}
+    /// @dev Plain ETH arrives only from a registered curve's graduation sweep; anything else would be
+    /// locked here forever, so it is refused.
+    receive() external payable {
+        if (!isBondingCurve[msg.sender]) revert NotBondingCurve();
+    }
 }

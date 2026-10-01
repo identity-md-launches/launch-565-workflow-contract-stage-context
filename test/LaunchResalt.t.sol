@@ -5,11 +5,13 @@ import {Test} from "forge-std/Test.sol";
 import {PoolManager} from "@uniswap/v4-core/src/PoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PvPadFactory} from "../src/PvPadFactory.sol";
 import {PvPadToken} from "../src/PvPadToken.sol";
+import {BondingCurve} from "../src/BondingCurve.sol";
 import {PvPadHook, IPvPadLaunchRegistry} from "../src/hooks/PvPadHook.sol";
 import {FeeEscrow} from "../src/FeeEscrow.sol";
 import {WorkerSubsidy} from "../src/WorkerSubsidy.sol";
@@ -39,6 +41,8 @@ contract LaunchResaltTest is Test {
     uint160 internal constant POISON = uint160(1) << 96;
 
     event LaunchSaltRetried(uint256 indexed launchId, uint256 attempt, address token);
+    event LaunchPoolRealigned(uint256 indexed launchId, uint160 foreignSqrtPriceX96);
+    event PoolRealigned(PoolId indexed poolId, uint160 fromSqrtPriceX96, uint160 toSqrtPriceX96);
 
     function setUp() public {
         manager = new PoolManager(address(this));
@@ -122,24 +126,102 @@ contract LaunchResaltTest is Test {
         assertEq(price, factory.canonicalSqrtPriceX96());
     }
 
-    function test_everyBoundedSaltPoisonedFailsClosedWithoutCharging() public {
+    /// @dev Every bounded candidate poisoned: the create no longer fails closed. The first candidate is
+    /// used and its empty, now-bound pool is moved back to the canonical price through the hook.
+    function test_everyBoundedSaltPoisonedRealignsFirstCandidateAndNeverSeedsForeignPrice() public {
         uint256 attempts = factory.MAX_SALT_ATTEMPTS();
         for (uint256 i; i < attempts; ++i) {
             manager.initialize(_key(_token(address(factory), 1, creator, "Brick", "BRK", 0, i)), POISON);
         }
-        vm.expectRevert(PvPadFactory.UnexpectedPoolPrice.selector);
-        factory.predictLaunchToken(creator, "Brick", "BRK", 0);
-        uint256 balanceBefore = creator.balance;
+        address first = _token(address(factory), 1, creator, "Brick", "BRK", 0, 0);
+        (address predicted, uint256 attempt) = factory.predictLaunchToken(creator, "Brick", "BRK", 0);
+        assertEq(predicted, first);
+        assertEq(attempt, 0);
+        uint256 managerBalance = address(manager).balance;
+
+        vm.expectEmit(true, true, true, true, address(hook));
+        emit PoolRealigned(_key(first).toId(), POISON, factory.canonicalSqrtPriceX96());
+        vm.expectEmit(true, true, true, true, address(factory));
+        emit LaunchPoolRealigned(1, POISON);
         vm.prank(creator);
-        vm.expectRevert(PvPadFactory.UnexpectedPoolPrice.selector);
-        factory.createLaunch{value: FEE}("Brick", "BRK");
-        assertEq(factory.launchCount(), 1);
-        assertEq(creator.balance, balanceBefore);
-        assertEq(workers.workerPot(), 0);
-        for (uint256 i; i < attempts; ++i) {
-            assertEq(_token(address(factory), 1, creator, "Brick", "BRK", 0, i).code.length, 0);
+        uint256 id = factory.createLaunch{value: FEE}("Brick", "BRK");
+        assertEq(id, 1);
+        (, address token, address curve,, PoolId poolId) = factory.launches(id);
+        assertEq(token, first);
+        assertEq(PvPadToken(token).balanceOf(curve), 1e27);
+        (uint160 price,,,) = StateLibrary.getSlot0(manager, poolId);
+        assertEq(price, factory.canonicalSqrtPriceX96());
+        assertEq(StateLibrary.getLiquidity(manager, poolId), 0);
+        assertEq(address(manager).balance, managerBalance, "realignment moves no ETH");
+        assertEq(PvPadToken(token).balanceOf(address(manager)), 0, "realignment moves no tokens");
+        assertEq(workers.workerPot(), FEE);
+        for (uint256 i = 1; i < attempts; ++i) {
+            (uint160 poisoned,,,) =
+                StateLibrary.getSlot0(manager, _key(_token(address(factory), 1, creator, "Brick", "BRK", 0, i)).toId());
+            assertEq(poisoned, POISON, "untouched candidates keep the attacker's price");
         }
-        // A fresh user salt or any other input moves to an unpoisoned derivation.
+
+        // The realigned launch graduates and trades like any other.
+        vm.prank(creator);
+        BondingCurve(payable(curve)).buy{value: 5 ether}(creator, 1, block.timestamp);
+        factory.graduate(id);
+        assertEq(factory.lockedTickLower(id), -887220);
+        assertEq(factory.lockedTickUpper(id), 887220);
+        assertGt(factory.lockedLiquidity(id), 0);
+    }
+
+    /// @dev Reproduces the reviewer's genesis proof: all 16 genesis candidates of the future factory
+    /// address are poisoned, yet the constructor succeeds with genesis at the canonical price.
+    function test_everyGenesisCandidatePoisonedStillConstructsAtCanonicalPrice() public {
+        FactoryDeployer deployer = new FactoryDeployer();
+        address futureFactory = vm.computeCreateAddress(address(deployer), 1);
+        for (uint256 i; i < 16; ++i) {
+            manager.initialize(_key(_token(futureFactory, 0, creator, "Pepe Values Pepe", "PVP", 0, i)), POISON);
+        }
+        address first = _token(futureFactory, 0, creator, "Pepe Values Pepe", "PVP", 0, 0);
+        vm.expectEmit(true, true, true, true, futureFactory);
+        emit LaunchPoolRealigned(0, POISON);
+        PvPadFactory realigned = deployer.deploy(manager, workers, king, hook, creator);
+        assertEq(address(realigned), futureFactory);
+        assertEq(realigned.launchCount(), 1);
+        (, address token, address curve,, PoolId poolId) = realigned.launches(0);
+        assertEq(token, first);
+        assertEq(PvPadToken(token).balanceOf(curve), 1e27);
+        (uint160 price,,,) = StateLibrary.getSlot0(manager, poolId);
+        assertEq(price, realigned.canonicalSqrtPriceX96());
+    }
+
+    /// @dev Realignment works from either side of the canonical price, including the most extreme
+    /// prices v4 accepts, and still moves no value because the gated pool holds no liquidity.
+    function test_realignmentFromExtremeForeignPricesInBothDirections() public {
+        uint256 attempts = factory.MAX_SALT_ATTEMPTS();
+        for (uint256 i; i < attempts; ++i) {
+            manager.initialize(
+                _key(_token(address(factory), 1, creator, "Low", "LOW", 0, i)), TickMath.MIN_SQRT_PRICE + 1
+            );
+            manager.initialize(
+                _key(_token(address(factory), 2, creator, "High", "HIGH", 0, i)), TickMath.MAX_SQRT_PRICE - 1
+            );
+        }
+        uint256 managerBalance = address(manager).balance;
+        vm.startPrank(creator);
+        uint256 low = factory.createLaunch{value: FEE}("Low", "LOW");
+        uint256 high = factory.createLaunch{value: FEE}("High", "HIGH");
+        vm.stopPrank();
+        (,,,, PoolId lowId) = factory.launches(low);
+        (,,,, PoolId highId) = factory.launches(high);
+        (uint160 lowPrice,,,) = StateLibrary.getSlot0(manager, lowId);
+        (uint160 highPrice,,,) = StateLibrary.getSlot0(manager, highId);
+        assertEq(lowPrice, factory.canonicalSqrtPriceX96());
+        assertEq(highPrice, factory.canonicalSqrtPriceX96());
+        assertEq(address(manager).balance, managerBalance);
+    }
+
+    function test_freshUserSaltStillEscapesPoisonedDerivations() public {
+        uint256 attempts = factory.MAX_SALT_ATTEMPTS();
+        for (uint256 i; i < attempts; ++i) {
+            manager.initialize(_key(_token(address(factory), 1, creator, "Brick", "BRK", 0, i)), POISON);
+        }
         vm.prank(creator);
         uint256 id = factory.createLaunch{value: FEE}("Brick", "BRK", bytes32(uint256(1)));
         assertEq(id, 1);

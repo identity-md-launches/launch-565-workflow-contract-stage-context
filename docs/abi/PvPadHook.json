@@ -1051,6 +1051,51 @@
   },
   {
     "type": "function",
+    "name": "realignPool",
+    "inputs": [
+      {
+        "name": "key",
+        "type": "tuple",
+        "internalType": "struct PoolKey",
+        "components": [
+          {
+            "name": "currency0",
+            "type": "address",
+            "internalType": "Currency"
+          },
+          {
+            "name": "currency1",
+            "type": "address",
+            "internalType": "Currency"
+          },
+          {
+            "name": "fee",
+            "type": "uint24",
+            "internalType": "uint24"
+          },
+          {
+            "name": "tickSpacing",
+            "type": "int24",
+            "internalType": "int24"
+          },
+          {
+            "name": "hooks",
+            "type": "address",
+            "internalType": "contract IHooks"
+          }
+        ]
+      },
+      {
+        "name": "targetSqrtPriceX96",
+        "type": "uint160",
+        "internalType": "uint160"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "retryDeferred",
     "inputs": [
       {
@@ -1090,6 +1135,25 @@
       }
     ],
     "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "unlockCallback",
+    "inputs": [
+      {
+        "name": "rawData",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "stateMutability": "nonpayable"
   },
   {
     "type": "event",
@@ -1185,6 +1249,31 @@
     "anonymous": false
   },
   {
+    "type": "event",
+    "name": "PoolRealigned",
+    "inputs": [
+      {
+        "name": "poolId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "PoolId"
+      },
+      {
+        "name": "fromSqrtPriceX96",
+        "type": "uint160",
+        "indexed": false,
+        "internalType": "uint160"
+      },
+      {
+        "name": "toSqrtPriceX96",
+        "type": "uint160",
+        "indexed": false,
+        "internalType": "uint160"
+      }
+    ],
+    "anonymous": false
+  },
+  {
     "type": "error",
     "name": "AmountTooLarge",
     "inputs": []
@@ -1199,6 +1288,11 @@
         "internalType": "address"
       }
     ]
+  },
+  {
+    "type": "error",
+    "name": "InvalidCallback",
+    "inputs": []
   },
   {
     "type": "error",
@@ -1222,6 +1316,11 @@
   },
   {
     "type": "error",
+    "name": "NothingToRealign",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "PartialFill",
     "inputs": []
   },
@@ -1232,7 +1331,17 @@
   },
   {
     "type": "error",
+    "name": "PoolHasLiquidity",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "PoolNotGraduated",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "RealignFailed",
     "inputs": []
   },
   {

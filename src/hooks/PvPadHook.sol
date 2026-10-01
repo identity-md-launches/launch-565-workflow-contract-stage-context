@@ -6,6 +6,8 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {
     BeforeSwapDelta,
@@ -31,7 +33,7 @@ interface IPvPadTokenFactory {
 /// beforeAddLiquidity, beforeSwap, afterSwap and both swap return-delta flags. No beforeInitialize.
 /// Before graduation only the bound factory may add liquidity, so nobody can saturate a tick's
 /// liquidity cap or otherwise shape the pool ahead of the locked graduation deposit.
-contract PvPadHook is IHooks, ReentrancyGuard {
+contract PvPadHook is IHooks, IUnlockCallback, ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
 
     error NotPoolManager();
@@ -44,6 +46,10 @@ contract PvPadHook is IHooks, ReentrancyGuard {
     error PartialFill();
     error AmountTooLarge();
     error UnsupportedCallback();
+    error NothingToRealign();
+    error PoolHasLiquidity();
+    error InvalidCallback();
+    error RealignFailed();
 
     /// @notice Address bits (masked by Hooks.ALL_HOOK_MASK) a deployed instance must carry.
     uint160 public constant REQUIRED_FLAGS = PvPadConstants.HOOK_FLAGS;
@@ -63,8 +69,11 @@ contract PvPadHook is IHooks, ReentrancyGuard {
     mapping(address escrow => mapping(address creator => mapping(address beneficiary => uint256 amount))) public
         deferredKingShares;
     uint256 public totalDeferred;
+    /// @dev Hash of the realignment in flight; nonzero only between `unlock` and its callback.
+    bytes32 private pendingRealign;
 
     event PoolBound(PoolId indexed poolId, address indexed factory, address creator, address escrow);
+    event PoolRealigned(PoolId indexed poolId, uint160 fromSqrtPriceX96, uint160 toSqrtPriceX96);
     event FeeDeferred(address indexed escrow, address indexed creator, address indexed beneficiary, uint256 amount);
     event DeferredDelivered(
         address indexed escrow, address indexed creator, address indexed beneficiary, uint256 amount
@@ -115,6 +124,41 @@ contract PvPadHook is IHooks, ReentrancyGuard {
         if (address(bindings[id].registry) != address(0)) revert PoolAlreadyBound();
         bindings[id] = PoolBinding(IPvPadLaunchRegistry(msg.sender), escrow, creator);
         emit PoolBound(id, msg.sender, creator, address(escrow));
+    }
+
+    /// @notice Moves a bound pool that someone preinitialized at a foreign price back to `targetSqrtPriceX96`.
+    /// @dev Only the bound factory may call it, and only while the pool holds no liquidity, which the
+    /// `beforeAddLiquidity` gate guarantees before graduation and which can never recur afterwards
+    /// (the factory's graduation position is permanent). With zero liquidity a swap moves the price to
+    /// its limit without transferring value; the callback verifies the delta is exactly zero. Nothing
+    /// here calls back into the factory, so constructor-created genesis can use it. The PoolManager
+    /// skips this hook's own callbacks because the hook is the swapping caller.
+    function realignPool(PoolKey calldata key, uint160 targetSqrtPriceX96) external nonReentrant {
+        PoolId id = key.toId();
+        if (address(bindings[id].registry) != msg.sender) revert NotLaunchFactory();
+        (uint160 current,,,) = StateLibrary.getSlot0(poolManager, id);
+        if (current == 0 || current == targetSqrtPriceX96) revert NothingToRealign();
+        if (StateLibrary.getLiquidity(poolManager, id) != 0) revert PoolHasLiquidity();
+        bytes memory data = abi.encode(key, current > targetSqrtPriceX96, targetSqrtPriceX96);
+        pendingRealign = keccak256(data);
+        poolManager.unlock(data);
+        if (pendingRealign != bytes32(0)) revert InvalidCallback();
+        (uint160 realigned,,,) = StateLibrary.getSlot0(poolManager, id);
+        if (realigned != targetSqrtPriceX96) revert RealignFailed();
+        emit PoolRealigned(id, current, targetSqrtPriceX96);
+    }
+
+    /// @dev Only the realignment swap. A one-wei exact input against zero liquidity consumes nothing
+    /// and leaves the price exactly at the limit.
+    function unlockCallback(bytes calldata rawData) external onlyPoolManager returns (bytes memory) {
+        if (pendingRealign == bytes32(0) || keccak256(rawData) != pendingRealign) revert InvalidCallback();
+        pendingRealign = bytes32(0);
+        (PoolKey memory key, bool zeroForOne, uint160 target) = abi.decode(rawData, (PoolKey, bool, uint160));
+        BalanceDelta delta = poolManager.swap(
+            key, IPoolManager.SwapParams({zeroForOne: zeroForOne, amountSpecified: -1, sqrtPriceLimitX96: target}), ""
+        );
+        if (BalanceDelta.unwrap(delta) != 0) revert RealignFailed();
+        return "";
     }
 
     modifier onlyPoolManager() {

@@ -62,7 +62,6 @@ contract CurveSequenceHandler is Test {
     uint256 public grossBuys;
     uint256 public netSells;
     uint256 public fees;
-    uint256 public nativeDonations;
     uint256 public tokenDonations;
     uint256 public workerFunding;
     uint256 public sweptNative;
@@ -189,13 +188,17 @@ contract CurveSequenceHandler is Test {
         uint256 tokens = bound(tokenSeed, 0, token.balanceOf(actor));
         uint256 beforeEthReserve = curve.ethReserve();
         uint256 beforeTokenReserve = curve.tokenReserve();
+        uint256 beforeCurveBalance = address(curve).balance;
+        uint256 beforeActorBalance = actor.balance;
         vm.startPrank(actor);
+        // The curve has no receive(): a plain ETH transfer (even zero) is refused and nothing is locked.
         (bool ok,) = address(curve).call{value: ethAmount}("");
-        assertTrue(ok);
+        assertFalse(ok, "plain ETH transfers to the curve are rejected");
         token.transfer(address(curve), tokens);
         vm.stopPrank();
-        nativeDonations += ethAmount;
         tokenDonations += tokens;
+        assertEq(address(curve).balance, beforeCurveBalance);
+        assertEq(actor.balance, beforeActorBalance);
         assertEq(curve.ethReserve(), beforeEthReserve, "donations do not buy curve capacity");
         assertEq(curve.tokenReserve(), beforeTokenReserve);
     }
@@ -336,10 +339,11 @@ contract CurveInvariantTest is Test {
         targetSelector(FuzzSelector(address(handler), selectors));
     }
 
-    /// SPEC conservation: actual reserves exclude donations and deferred fee liabilities.
+    /// SPEC conservation: actual reserves exclude token donations and deferred fee liabilities; the
+    /// curve's ETH balance is exactly its reserves plus deferred fees because plain transfers are refused.
     function invariant_curveReservesEqualIndependentCashFlows() public view {
         assertEq(handler.grossBuys(), handler.netSells() + handler.fees() + curve.ethReserve() + handler.sweptNative());
-        assertEq(address(curve).balance, curve.ethReserve() + curve.totalDeferredFees() + handler.nativeDonations());
+        assertEq(address(curve).balance, curve.ethReserve() + curve.totalDeferredFees());
         assertEq(token.balanceOf(address(curve)), curve.tokenReserve() + handler.tokenDonations());
         assertLe(curve.ethReserve(), 4.2 ether);
         assertEq(curve.readyToGraduate(), handler.fundingComplete() && !handler.terminal());

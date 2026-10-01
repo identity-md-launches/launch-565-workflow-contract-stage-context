@@ -1,5 +1,78 @@
 # Changelog
 
+## Revision after independent review (contract stage)
+
+Dispositions of the review's findings. Economics, roles and the approved design (atomic genesis in the
+factory constructor, shared 0x08cc hook, bounded re-salt, liquidity gate) are unchanged.
+
+### MEDIUM, fixed: pre-poisoned genesis candidates blocked factory deployment (`PvPadHook`, `PvPadFactory`)
+
+- Cause: the 16 genesis token candidates are a pure function of the future factory address, and the
+  bounded salt scan reverted `UnexpectedPoolPrice` inside the constructor once all of them were
+  preinitialized at a foreign price; every retry at that address failed the same way.
+- Fix: `PvPadHook.realignPool(key, target)`, callable only by the pool's bound registry, moves an
+  initialized, empty pool to the target price with a zero-value swap (the PoolManager skips the hook's
+  own callbacks when the hook is the swapping caller). It reverts `NothingToRealign` for an
+  uninitialized or already-correct pool, `PoolHasLiquidity` if any liquidity exists (never the case
+  before graduation thanks to the `beforeAddLiquidity` gate, always the case after), `InvalidCallback`
+  for any callback outside a realignment, and `RealignFailed` unless the swap delta is exactly zero
+  and the price lands on the target. It makes no call into the registry, so the constructor can use
+  it. `PvPadFactory._selectSalt` still prefers an unpoisoned candidate and emits `LaunchSaltRetried`;
+  when all 16 are poisoned it returns the first candidate and `_initializeCanonicalPool` realigns it,
+  re-checks the price (hard stop kept) and emits `LaunchPoolRealigned(launchId, foreignSqrtPriceX96)`.
+  `predictLaunchToken` no longer reverts in that case. `createLaunch` gains the same protection.
+- Proofs: the reviewer's `Proof_9d5b3504d43a` (fails before, passes after);
+  `LaunchResaltTest.test_everyGenesisCandidatePoisonedStillConstructsAtCanonicalPrice`,
+  `test_everyBoundedSaltPoisonedRealignsFirstCandidateAndNeverSeedsForeignPrice` (events, zero value
+  moved, untouched sibling candidates, graduation afterwards),
+  `test_realignmentFromExtremeForeignPricesInBothDirections`; `PoolRealignTest` (only the bound
+  registry, unbound and already-correct pools refused, graduated pool refused, callback
+  authentication, realigned pool graduates and charges fees normally).
+
+### MEDIUM, disputed as service configuration: constructor needs live PoolManager code
+
+- Reproduced: without PoolManager code at the configured address the factory constructor reverts, so
+  the offline protected floor cannot construct the fourth manifest contract. The same inputs pass on
+  a Sepolia fork. Deferring genesis out of the constructor would drop the atomic initialization the
+  design relies on, and the review's own genesis proof asserts the genesis pool is at the canonical
+  price when the constructor returns. Documented under "Deployment prerequisites" in the README: the
+  floor, admission and gas estimates must run against Sepolia state.
+
+### MEDIUM, disputed as service evidence: hook needs a mined CREATE2 salt
+
+- Reproduced: unmined salts cannot construct `PvPadHook` (v4 derives permissions from address bits;
+  the brief mandates 0x08cc). Added `script/MineHookSalt.s.sol` (`--sig "mine(address,address)"`),
+  an offline evidence generator printing deployer, PoolManager, init-code hash, salt, predicted
+  address and flags, plus `ProjectDeploymentTest.test_mineHookSaltScriptMatchesTheDeployedHookAndUnminedSaltsFail`.
+  The hook's creation code changed in this revision, so previously mined salts are void.
+
+### LOW, fixed: unguarded `receive()` on the factory and the curve
+
+- `PvPadFactory.receive()` now reverts `NotBondingCurve` unless the sender is a registered curve (the
+  graduation sweep still works); `BondingCurve` has no `receive()` at all. Stray ETH is refunded by
+  the revert instead of being locked. `CurveInvariantTest`'s donation handler now asserts the refusal
+  and the curve's balance equals reserves plus deferred fees exactly;
+  `FactoryAdversarialTest.test_strayEthToFactoryOrCurveIsRejectedWhileGraduationSweepStillWorks`.
+
+### LOW, fixed: unbounded epoch start could park the worker pot
+
+- `WorkerSubsidy.setEpoch` also requires `windowStart - block.timestamp <= 90 days`, so an epoch can
+  delay the reserved budget by at most two windows before claims open and recycling follows.
+  `FeesWorkersTest.testWorkerEpochValidationDoesNotConsumePot` (far-future starts rejected) and
+  `testWorkerEpochStartBoundedByMaxWindowKeepsPotRecoverable`.
+
+### INFO, documented: any contract can bind its own pool to the shared hook
+
+- No code change (tightening `bindPool` to one factory would change the shared-hook design). The README
+  now tells integrators to identify launches only through `PvPadFactory` and never through the hook
+  address, `PoolBound` events or a foreign registry's `isRegisteredPool`.
+
+### Validation
+
+- `forge build`, `forge test` (135 passed, 0 failed, 0 skipped, 19 suites), `forge fmt --check`,
+  `python3 tools/export_abis.py --check` (hook and factory ABIs regenerated). PvPadFactory runtime is
+  22,410 bytes, init code 40,343 bytes.
+
 ## Contract-stage delivery from pinned source 9007278e
 
 - Restored the approved contracts, tests, specification and ordinary-file dependencies from

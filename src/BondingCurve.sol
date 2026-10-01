@@ -238,5 +238,5 @@ contract BondingCurve is ReentrancyGuard {
         if (!ok) revert NativeTransferFailed();
     }
 
-    receive() external payable {}
+    // No receive(): ETH enters only through buy(). A plain transfer would be locked here forever.
 }

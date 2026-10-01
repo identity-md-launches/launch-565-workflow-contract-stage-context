@@ -84,11 +84,13 @@ contract WorkerSubsidy is ReentrancyGuard {
         return keccak256(bytes.concat(keccak256(abi.encode(epochId, payee, amount))));
     }
 
+    /// @dev The window may neither last nor start more than MAX_EPOCH_WINDOW ahead, so an epoch can
+    /// delay the reserved pot by at most two windows before claims open or recycling is possible.
     function setEpoch(bytes32 root, uint256 windowStart, uint256 windowEnd) external onlyUpdater nonReentrant {
         if (root == bytes32(0)) revert InvalidRoot();
         if (
-            windowStart < block.timestamp || windowEnd <= windowStart
-                || windowEnd - windowStart > PvPadConstants.MAX_EPOCH_WINDOW
+            windowStart < block.timestamp || windowStart - block.timestamp > PvPadConstants.MAX_EPOCH_WINDOW
+                || windowEnd <= windowStart || windowEnd - windowStart > PvPadConstants.MAX_EPOCH_WINDOW
         ) revert InvalidWindow();
         uint256 budget = workerPot;
         if (budget == 0) revert NothingToFund();
