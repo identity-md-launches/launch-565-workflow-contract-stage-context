@@ -1,5 +1,61 @@
 # Changelog
 
+## Source-only continue: genesis-poison deployability proof (judge MEDIUM #3)
+
+Continues job b8f68a19-42b0-428e-80af-0582d26a2805 (blocked: protected floor, project constructor failed).
+No redeploy, no site, no new economics; SPEC.md v4 is unchanged (1% fee, 50/50 king/creator, multi-token
+factory, graduation at 4.2 ETH, locked full-range LP, hook flags 0x08cc, `beforeAddLiquidity` gate, no
+`beforeInitialize`, PoolManager-only hook constructor). `launch.json` is not edited: constructor
+signatures, ABIs and the manifest schema are the same as the reviewed revision.
+
+### Finding: pre-poisoned genesis candidates must not brick the factory's CREATE2 address
+
+- Scenario: the 16 genesis candidate pools (ETH / `token_n`, fee 0, spacing 60, shared `PvPadHook`) are a
+  pure function of the announced factory address. Anyone can `PoolManager.initialize` all of them at a
+  foreign price before the deploy transaction; the original `_selectSalt` then reverted
+  `UnexpectedPoolPrice` inside the constructor and every retry at the same address failed the same way.
+- Fix in this tree (from the reviewed revision, re-verified here, no source change needed):
+  `PvPadHook.realignPool` lets the bound registry move an initialized, liquidity-free pool to the
+  canonical price with a zero-value swap, and `PvPadFactory._initializeCanonicalPool` uses it when every
+  bounded candidate is poisoned, then re-reads the price (hard stop `UnexpectedPoolPrice` kept). The
+  constructor signature, `MAX_SALT_ATTEMPTS = 16` and the `createLaunch` re-salt order are unchanged, and
+  a foreign price is never accepted for a genesis or graduated pool.
+- New proof `test/GenesisPoison.t.sol` (`GenesisPoisonTest`, 7 tests), modelled on the judge's scenario
+  with a service-style CREATE2 deployer whose factory address is known before the deploy:
+  all 16 candidates poisoned at a foreign price, factory still deploys at the predicted address, genesis
+  is candidate 0 at the canonical price with zero liquidity, `PoolRealigned` and `LaunchPoolRealigned`
+  emitted, no ETH or tokens move, the attacker gains nothing, the 15 siblings stay unbound at the
+  attacker's price, and genesis then graduates full range and charges the 1% fee; 64 fuzz runs over
+  foreign prices on both sides of canonical (down to `MIN_SQRT_PRICE`, up to `MAX_SQRT_PRICE - 1`);
+  canonical-price preinitialization accepted with no realignment or re-salt; partial poison re-salts to
+  the first clean candidate inside the constructor; failure paths: nobody but the bound factory can move
+  the genesis price, re-initialization reverts `PoolAlreadyInitialized`, the realigned pool stays closed
+  to swaps (`PoolNotGraduated`) and liquidity (`LiquidityClosed`) through a direct PoolManager probe, the
+  factory cannot realign an unbound sibling, a realignment that leaves a foreign price aborts the deploy
+  with the CREATE2 address still free and the same salt retries cleanly, and later `createLaunch` calls
+  keep the bounded re-salt.
+- Existing grief proofs are untouched and still pass: `beforeAddLiquidity` `LiquidityClosed`
+  (`GraduationLiquidityTest`, `HookSecurityTest`), threshold sell block (`GraduationLiquidityTest`,
+  `PvPadIntegrationTest`), hook flags 0x08cc (`HookSecurityTest`, `ProjectDeploymentTest`), bounded
+  re-salt and realignment (`LaunchResaltTest`, `PoolRealignTest`).
+
+### Remaining admission items (out of scope for this continue)
+
+Both are service-side and were already reproduced and documented in the README's "Deployment
+prerequisites"; nothing in Solidity changes them, and relaxing `HookAddressNotValid` or skipping the
+PoolManager initialization in the constructor is not an acceptable fix:
+
+1. The hook needs a CREATE2 salt mined for the deployer, the attested creation bytes and the PoolManager
+   argument so the address carries 0x08cc (`script/MineHookSalt.s.sol --sig "mine(address,address)"`).
+2. The protected deployment floor, admission and gas estimation must run on a Sepolia fork with the live
+   PoolManager at the configured address, because the factory constructor binds, initializes or realigns
+   the genesis pool on it. These belong to the next fresh `workflow.open`.
+
+### Validation
+
+- `forge build`, `forge test` (167 passed, 0 failed, 0 skipped, 21 suites), `forge fmt --check`.
+  No ABI changed, so `docs/abi/*.json` and `launch.json` are untouched.
+
 ## Revision after independent review (contract stage)
 
 Dispositions of the review's findings. Economics, roles and the approved design (atomic genesis in the
